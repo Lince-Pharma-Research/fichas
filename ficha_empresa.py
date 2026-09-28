@@ -33,19 +33,20 @@ from datos_manuales import CALENDARIO_REGULATORIO, CONTEXTO_BURSATIL
 # CONFIG
 # ============================================================
 
+# "patrocinadores": nombres con los que la empresa figura como PATROCINADOR
+# PRINCIPAL en ClinicalTrials.gov. El primero es obligatorio; los demás se suman
+# (sin duplicar ensayos). Si un nombre no existe, simplemente no suma nada.
+# Comprobado en el registro: el nombre "GSK" solo recogía 5 ensayos en curso,
+# porque la mayoría siguen registrados como "GlaxoSmithKline".
 EMPRESAS = [
-    {"nombre": "GSK", "sponsor_query": "GSK", "sponsor_lead": "GlaxoSmithKline"},
-    {"nombre": "Bayer", "sponsor_query": "Bayer", "sponsor_lead": "Bayer"},
-    {"nombre": "Pfizer", "sponsor_query": "Pfizer", "sponsor_lead": "Pfizer"},
-    {"nombre": "Novartis", "sponsor_query": "Novartis", "sponsor_lead": "Novartis Pharmaceuticals"},
-    {"nombre": "Johnson & Johnson", "sponsor_query": "Johnson & Johnson",
-     "sponsor_lead": "Janssen Research & Development, LLC"},
+    {"nombre": "GSK", "patrocinadores": ["GlaxoSmithKline", "GSK", "ViiV Healthcare"]},
+    {"nombre": "Bayer", "patrocinadores": ["Bayer"]},
+    {"nombre": "Pfizer", "patrocinadores": ["Pfizer"]},
+    {"nombre": "Novartis", "patrocinadores": ["Novartis Pharmaceuticals"]},
+    {"nombre": "Johnson & Johnson",
+     "patrocinadores": ["Janssen Research & Development, LLC",
+                        "Johnson & Johnson Innovative Medicine"]},
 ]
-
-# Mientras se ajusta la consulta a ClinicalTrials.gov, el robot imprime en su
-# registro varios recuentos de prueba por empresa ([DIAGNÓSTICO]). No cambia
-# las fichas. Cuando todo esté afinado, se puede poner en False.
-DIAGNOSTICO = True
 
 SITIO_WEB = "https://lincepharmaresearch.beehiiv.com/"
 NOMBRE_MARCA = "Lince Pharma Research"
@@ -91,14 +92,13 @@ def fase_principal(fases):
     return "OTRA"
 
 
-def consultar_pipeline(sponsor_query):
-    """Devuelve (lista_de_ensayos, total) o (None, None) si falla la consulta."""
+def _consultar_un_patrocinador(nombre_patrocinador):
+    """Ensayos en curso con ese patrocinador principal. Devuelve lista o None si falla."""
     params = {
-        "query.spons": sponsor_query,
+        "query.lead": nombre_patrocinador,
         "filter.overallStatus": ESTADOS_EN_CURSO,
-        "fields": "NCTId,BriefTitle,OverallStatus,Phase",
+        "fields": "NCTId,BriefTitle,OverallStatus,Phase,LastUpdatePostDate",
         "pageSize": 1000,
-        "countTotal": "true",
         "sort": "LastUpdatePostDate:desc",
     }
     try:
@@ -106,8 +106,8 @@ def consultar_pipeline(sponsor_query):
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as e:
-        print(f"  [AVISO] No se pudo consultar ClinicalTrials.gov: {e}")
-        return None, None
+        print(f"  [AVISO] No se pudo consultar '{nombre_patrocinador}': {e}")
+        return None
 
     ensayos = []
     for study in data.get("studies", []):
@@ -120,33 +120,26 @@ def consultar_pipeline(sponsor_query):
             "titulo": ident.get("briefTitle", ""),
             "estado": estado.get("overallStatus", ""),
             "fase": fase_principal(diseno.get("phases", [])),
+            "actualizado": estado.get("lastUpdatePostDateStruct", {}).get("date", ""),
         })
-    total = data.get("totalCount", len(ensayos))
-    return ensayos, total
+    print(f"  '{nombre_patrocinador}': {len(ensayos)} ensayos en curso")
+    return ensayos
 
 
-def _contar(extra):
-    """Devuelve solo el número total de ensayos que devuelve una consulta."""
-    params = {"pageSize": 1, "countTotal": "true"}
-    params.update(extra)
-    try:
-        resp = requests.get(CLINICALTRIALS_API, params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json().get("totalCount")
-    except (requests.RequestException, ValueError) as e:
-        return f"error: {e}"
-
-
-def diagnostico(empresa):
-    """Imprime recuentos con distintas variantes de consulta, para elegir la buena."""
-    q, lead = empresa["sponsor_query"], empresa["sponsor_lead"]
-    barra = ESTADOS_EN_CURSO.replace(",", "|")
-    print(f"  [DIAGNÓSTICO] {empresa['nombre']}")
-    print(f"    spons='{q}', sin filtro de estado:      {_contar({'query.spons': q})}")
-    print(f"    spons='{q}', estados (con comas):        {_contar({'query.spons': q, 'filter.overallStatus': ESTADOS_EN_CURSO})}")
-    print(f"    spons='{q}', estados (con barras):       {_contar({'query.spons': q, 'filter.overallStatus': barra})}")
-    print(f"    spons='{lead}', estados (con comas):     {_contar({'query.spons': lead, 'filter.overallStatus': ESTADOS_EN_CURSO})}")
-    print(f"    lead='{lead}', estados (con comas):      {_contar({'query.lead': lead, 'filter.overallStatus': ESTADOS_EN_CURSO})}")
+def consultar_pipeline(patrocinadores):
+    """Suma los ensayos de todos los patrocinadores de la empresa, sin duplicados.
+    Devuelve (lista, total) o (None, None) si falla el patrocinador principal."""
+    unidos = {}
+    for i, nombre in enumerate(patrocinadores):
+        ensayos = _consultar_un_patrocinador(nombre)
+        if ensayos is None:
+            if i == 0:
+                return None, None  # sin el principal, no publicamos datos parciales
+            continue
+        for e in ensayos:
+            unidos.setdefault(e["nct_id"], e)
+    lista = sorted(unidos.values(), key=lambda e: e["actualizado"], reverse=True)
+    return lista, len(lista)
 
 
 def resumir(ensayos, total):
@@ -209,7 +202,7 @@ def esc(t):
     return html.escape(str(t), quote=True)
 
 
-def bloque_pipeline(nombre, resumen, sponsor_query):
+def bloque_pipeline(nombre, resumen, patrocinadores):
     partes = []
     for fase in ORDEN_FASES:
         ensayos = resumen["por_fase"][fase]
@@ -227,12 +220,9 @@ def bloque_pipeline(nombre, resumen, sponsor_query):
         partes.append("</ul>")
     if not partes:
         partes.append("<p><em>No hay ensayos en curso registrados para esta empresa.</em></p>")
-    nota = (f"Ensayos en curso patrocinados por la compañía según ClinicalTrials.gov: "
-            f"<strong>{resumen['total']}</strong>"
-            + (f" (se muestran los {resumen['descargados']} más recientes)"
-               if resumen["total"] and resumen["total"] > resumen["descargados"] else "")
-            + f". <a href='https://clinicaltrials.gov/search?spons={esc(sponsor_query)}' target='_blank' rel='noopener'>"
-              f"Ver todos en ClinicalTrials.gov</a>.")
+    nota = (f"Ensayos en curso con la compañía como patrocinador principal en ClinicalTrials.gov: "
+            f"<strong>{resumen['total']}</strong>. Patrocinadores contados: "
+            f"{esc(', '.join(patrocinadores))}. Se muestran los más recientemente actualizados de cada fase.")
     return "".join(partes) + f"<p class='note'>{nota}</p>"
 
 
@@ -270,7 +260,7 @@ def generar_html_ficha(empresa, resumen, resumenes):
         out.append(f"<div class='card'><h2>Contexto bursátil</h2><p>{esc(contexto)}</p></div>")
 
     out.append("<div class='card'><h2>Pipeline por fase</h2>"
-               + bloque_pipeline(nombre, resumen, empresa["sponsor_query"]) + "</div>")
+               + bloque_pipeline(nombre, resumen, empresa["patrocinadores"]) + "</div>")
 
     calendario = CALENDARIO_REGULATORIO.get(nombre, [])
     if calendario:
@@ -301,12 +291,7 @@ def main():
     for empresa in EMPRESAS:
         nombre = empresa["nombre"]
         print(f"Consultando pipeline: {nombre}")
-        if DIAGNOSTICO:
-            try:
-                diagnostico(empresa)
-            except Exception as e:  # el diagnóstico nunca debe romper la generación
-                print(f"  [DIAGNÓSTICO] omitido por error: {e}")
-        ensayos, total = consultar_pipeline(empresa["sponsor_query"])
+        ensayos, total = consultar_pipeline(empresa["patrocinadores"])
         resumenes[nombre] = resumir(ensayos, total) if ensayos is not None else None
 
     generadas = 0
